@@ -1,4 +1,3 @@
-# 파일명: telegram_bot.py
 # -*- coding: utf-8 -*-
 import logging
 import datetime
@@ -355,18 +354,10 @@ class TelegramController:
             actual_qty = int(holdings.get(ticker, {'qty': 0})['qty']) if holdings else 0
             actual_avg = float(holdings.get(ticker, {'avg': 0})['avg']) if holdings else 0.0
             
-            seed = self.cfg.get_seed(ticker)
             split = self.cfg.get_split_count(ticker)
-            ver = self.cfg.get_version(ticker)
             
-            if ver == "V14":
-                _, one_portion, _ = self.cfg.calculate_v14_state(ticker)
-                if one_portion <= 0:
-                    one_portion = seed / split if split > 0 else 1
-            else:
-                one_portion = seed / split if split > 0 else 1
-            
-            t_val = (actual_qty * actual_avg) / one_portion if one_portion > 0 else 0.0
+            # 🚀 [V16.11 신규 최적화] 중앙 집중형 T값 산출 함수 호출
+            t_val, _ = self.cfg.get_absolute_t_val(ticker, actual_qty, actual_avg)
             
             report += f"📊 <b>[ 현재 진행 상황 요약 ]</b>\n"
             report += f"▪️ 현재 T값 : {t_val:.4f} T ({int(split)}분할)\n"

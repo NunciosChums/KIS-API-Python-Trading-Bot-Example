@@ -1,4 +1,3 @@
-# 파일명: config.py
 import json
 import os
 import datetime
@@ -99,17 +98,13 @@ class ConfigManager:
                     total += float(v)
         return total
 
-    # 🚀 [V15.1] T값 산출 절대 공식: (총 매수액 / 1회분)
-    def calculate_v15_t_val(self, ticker):
-        recs = [r for r in self.get_ledger() if r['ticker'] == ticker]
-        total_buy_amt = sum(r['price'] * r['qty'] for r in recs if r['side'] == 'BUY')
-        
+    # 🚀 [V16.11 신규 최적화] 중앙 통합 T값(절대 진행률) 및 1회분 예산 산출 헬퍼 함수
+    def get_absolute_t_val(self, ticker, actual_qty, actual_avg_price):
         seed = self.get_seed(ticker)
         split = self.get_split_count(ticker)
         one_portion = seed / split if split > 0 else 1
-        
-        t_val = total_buy_amt / one_portion
-        return round(t_val, 4)
+        t_val = (actual_qty * actual_avg_price) / one_portion if one_portion > 0 else 0.0
+        return round(t_val, 4), one_portion
 
     # 🚀 [V15.3] 제네시스 장부 캐싱
     def overwrite_genesis_ledger(self, ticker, genesis_records, actual_avg):
@@ -219,60 +214,52 @@ class ConfigManager:
         d[ticker] = {"is_active": is_active, "day_count": day_count, "exit_target": exit_target}
         self._save_json(self.FILES["REVERSE_CFG"], d)
 
+    # 🚀 [V16.11 최적화] 불필요한 과거 T값 추적 로직을 제거하고 잔금(rem_cash) 및 동적 예산만 깔끔하게 도출
     def calculate_v14_state(self, ticker):
         ledger = self.get_ledger()
         target_recs = sorted([r for r in ledger if r['ticker'] == ticker], key=lambda x: x.get('id', 0))
         
         seed = self.get_seed(ticker)
         split = self.get_split_count(ticker)
+        base_portion = seed / split if split > 0 else 1
         
         holdings = 0
-        t_val = 0.0
         rem_cash = seed
+        total_invested = 0.0
         
         for r in target_recs:
             if holdings == 0:
-                t_val = 0.0
                 rem_cash = seed
+                total_invested = 0.0
                 
             qty = r['qty']
-            price = r['price']
-            amt = qty * price
-            
-            is_rec_rev = r.get('is_reverse', False) 
+            amt = qty * r['price']
             
             if r['side'] == 'BUY':
-                if holdings == 0 and 'SYNC' in str(r.get('exec_id', '')):
-                    t_val = amt / (seed / split) if split > 0 else 0
-                    rem_cash -= amt
-                else:
-                    if is_rec_rev:
-                        t_val += (split - t_val) * 0.25
-                        rem_cash -= amt
-                    else:
-                        budget_of_day = rem_cash / (split - t_val) if (split - t_val) > 0 else rem_cash
-                        t_val += (amt / budget_of_day) if budget_of_day > 0 else 0
-                        rem_cash -= amt
+                rem_cash -= amt
                 holdings += qty
+                total_invested += amt
                 
             elif r['side'] == 'SELL':
                 if qty >= holdings: 
                     holdings = 0
-                    t_val = 0.0
                     rem_cash = seed
+                    total_invested = 0.0
                 else: 
+                    if holdings > 0:
+                        avg_price = total_invested / holdings
+                        total_invested -= (qty * avg_price)
                     holdings -= qty
-                    if is_rec_rev:
-                        multiplier = 0.9 if split <= 20 else 0.95
-                        t_val *= multiplier
-                    else:
-                        t_val *= 0.75
                     rem_cash += amt
                     
+        # 최신 KIS 팩트 기반 절대 T값 오버라이드 계산
+        avg_price = total_invested / holdings if holdings > 0 else 0.0
+        t_val = (holdings * avg_price) / base_portion if base_portion > 0 else 0.0
+            
         if holdings > 0:
             current_budget = rem_cash / (split - t_val) if (split - t_val) > 0 else rem_cash
         else:
-            current_budget = seed / split
+            current_budget = base_portion
             t_val = 0.0
             
         return max(0.0, round(t_val, 4)), max(0.0, current_budget), max(0.0, rem_cash)

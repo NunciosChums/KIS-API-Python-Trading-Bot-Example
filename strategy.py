@@ -1,13 +1,51 @@
-# 파일명: strategy.py
 import math
+import yfinance as yf
+import pandas as pd
+from datetime import datetime, timedelta
 
 class InfiniteStrategy:
-    # [V14.2] 전략 클래스 - V14.1 로직 온전히 유지
+    # 🚀 [V16.10] 전략 클래스 - 야후 파이낸스 MA5 엔진 네이티브 탑재
     def __init__(self, config):
         self.cfg = config
 
     def _ceil(self, val): return math.ceil(val * 100) / 100.0
     def _floor(self, val): return math.floor(val * 100) / 100.0
+
+    # 🌟 [V16.10 추가] 야후 파이낸스 5일선(MA5) 산출 전용 내부 엔진
+    def _get_ma5_yfinance(self, ticker):
+        try:
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=15)
+            
+            df = yf.download(
+                ticker, 
+                start=start_date.strftime('%Y-%m-%d'), 
+                end=end_date.strftime('%Y-%m-%d'), 
+                progress=False
+            )
+            
+            if df.empty:
+                print(f"  ❌ [야후 파이낸스] {ticker} 시세 데이터를 불러오지 못했습니다.")
+                return None
+                
+            if isinstance(df.columns, pd.MultiIndex):
+                close_prices = df['Close'][ticker]
+            else:
+                close_prices = df['Close']
+                
+            close_prices = close_prices.dropna()
+            last_5_days = close_prices.tail(5)
+            
+            if len(last_5_days) < 5:
+                print(f"  ⚠️ [경고] {ticker}의 5일치 영업일 데이터가 부족합니다.")
+                return None
+                
+            ma5_price = round(float(last_5_days.mean()), 2)
+            return ma5_price
+            
+        except Exception as e:
+            print(f"  ❌ [시스템 오류] 야후 파이낸스 MA5 계산 중 문제 발생: {e}")
+            return None
 
     def get_plan(self, ticker, current_price, avg_price, qty, prev_close, ma_5day=0.0, market_type="REG", available_cash=0, is_simulation=False, force_turbo_off=False):
         orders = []
@@ -17,7 +55,6 @@ class InfiniteStrategy:
         other_locked_cash = self.cfg.get_total_locked_cash(exclude_ticker=ticker)
         real_available_cash = max(0, available_cash - other_locked_cash)
         
-        seed = self.cfg.get_seed(ticker)
         split = self.cfg.get_split_count(ticker)      
         target_pct_val = self.cfg.get_target_profit(ticker) 
         target_ratio = target_pct_val / 100.0
@@ -30,11 +67,12 @@ class InfiniteStrategy:
         # [V14.9] 저장된 탈출 목표 꼬리표 불러오기
         exit_target = rev_state.get("exit_target", 0.0)
 
+        # 🚀 [V16.11 신규 최적화] 중앙 집중형 T값(절대 진행률) 및 기본 1회분 통합 산출
+        t_val, base_portion = self.cfg.get_absolute_t_val(ticker, qty, avg_price)
+
         if version == "V14":
-            _, one_portion_amt, rem_cash = self.cfg.calculate_v14_state(ticker)
-            
-            # 🔥 [V15.7] T값(진행률)의 완전한 독립: 장부 내역을 의존하지 않고 오직 KIS 팩트(총수량 × 평단가)로 오버라이드 계산
-            t_val = round((qty * avg_price) / one_portion_amt, 4) if one_portion_amt > 0 else 0.0
+            _, dynamic_budget, rem_cash = self.cfg.calculate_v14_state(ticker)
+            one_portion_amt = dynamic_budget
             
             # 🔥 [V14.1 조기 리버스모드] 우선순위에서 밀려 예수금이 부족한지 사전 감지
             # [V14.4 버그수정] 프리마켓 순찰(PRE_CHECK) 시 지갑 잔액이 넘어오지 않아 예산 부족으로 오인하는 현상 방어
@@ -80,16 +118,21 @@ class InfiniteStrategy:
                         # 🚀 [V16.8 추가] 탈출 시 휘발성 에스크로 금고 완벽 소각
                         self.cfg.clear_escrow_cash(ticker)
         else:
-            one_portion_amt = seed / split if split > 0 else 0
-            # 🔥 [V15.7] V13(무매3)에서도 T값 산출을 KIS 절대 공식으로 오버라이드
-            t_val = round((qty * avg_price) / one_portion_amt, 4) if one_portion_amt > 0 else 0.0
+            one_portion_amt = base_portion
 
         depreciation_factor = 2.0 / split if split > 0 else 0.1
         star_ratio = target_ratio - (target_ratio * depreciation_factor * t_val)
         
         # [V14.1 리버스모드] 리버스일 경우 별지점은 5일선 평균으로 강제 변경
         if is_reverse:
-            star_price = round(ma_5day, 2)
+            # 🚀 [V16.10 신규 로직] 야후 파이낸스 엔진으로 실시간 5일선 덮어쓰기 (레거시 주석 삭제 완료)
+            yf_ma5 = self._get_ma5_yfinance(ticker)
+            if yf_ma5 is not None:
+                star_price = yf_ma5
+            else:
+                # 야후 파이낸스 통신 실패 시에만 기존 전달받은 백업값 사용
+                star_price = round(ma_5day, 2)
+
             # 🔥 [V14.11 버그수정] 장부상 남은 잔금/4 를 쓰되, 실제 지갑에 남은 할당 금액(available_cash)을 절대 초과할 수 없도록 강제 방어! (마이너스 통장 방지)
             # 🚀 [V15 / V16.8 변경] 리버스 예산 분배 최적화 및 마이너스 통장 방지를 위해 real_available_cash 기준 방어!
             active_tickers_count = len(self.cfg.get_active_tickers())
