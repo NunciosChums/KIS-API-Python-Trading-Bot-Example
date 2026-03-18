@@ -135,7 +135,6 @@ class TelegramController:
         for t in sorted_tickers:
             h = holdings.get(t, {'qty':0, 'avg':0})
             
-            # 🌟 [V17.6 패치] 봇 블로킹 방어 (asyncio.to_thread 적용)
             curr = await asyncio.to_thread(self.broker.get_current_price, t, is_market_closed=(status_code == "CLOSE"))
             prev_close = await asyncio.to_thread(self.broker.get_previous_close, t)
             ma_5day = await asyncio.to_thread(self.broker.get_5day_ma, t)
@@ -213,6 +212,20 @@ class TelegramController:
                 actual_qty = int(holdings.get(ticker, {'qty': 0})['qty'])
                 actual_avg = float(holdings.get(ticker, {'avg': 0})['avg'])
                 
+                # 🌟 [V17.7 패치] 장중 해제 방지: 오직 아침 정산 시간에만 리버스 수익률 달성 검사 후 졸업 처리
+                rev_state = self.cfg.get_reverse_state(ticker)
+                if rev_state.get("is_active"):
+                    curr_p = await asyncio.to_thread(self.broker.get_current_price, ticker)
+                    if curr_p > 0 and actual_avg > 0:
+                        curr_ret = (curr_p - actual_avg) / actual_avg * 100.0
+                        exit_target = rev_state.get("exit_target", -20.0)
+                        if exit_target == 0.0: exit_target = -15.0 if ticker == "TQQQ" else -20.0
+                        
+                        if curr_ret >= exit_target:
+                            self.cfg.set_reverse_state(ticker, False, 0, 0.0)
+                            self.cfg.clear_escrow_cash(ticker)
+                            await context.bot.send_message(chat_id, f"🌤️ <b>[{ticker}] 리버스 목표 달성({curr_ret:.2f}%)!</b>\n격리 병동을 공식 졸업하고 가상 장부(Escrow)를 해제합니다.", parse_mode='HTML')
+                
                 recs = [r for r in self.cfg.get_ledger() if r['ticker'] == ticker]
                 ledger_qty, avg_price, _, _ = self.cfg.calculate_holdings(ticker, recs)
                 
@@ -230,7 +243,6 @@ class TelegramController:
                     if ledger_qty > 0:
                         kst = pytz.timezone('Asia/Seoul')
                         today_str = datetime.datetime.now(kst).strftime('%Y-%m-%d')
-                        # 🌟 [V17.6 패치] 봇 블로킹 방어 (asyncio.to_thread 적용)
                         prev_c = await asyncio.to_thread(self.broker.get_previous_close, ticker)
                         
                         new_hist, added_seed = self.cfg.archive_graduation(ticker, today_str, prev_c)
@@ -547,7 +559,7 @@ class TelegramController:
             
         elif action == "EXEC":
             t = sub
-            await query.edit_message_text(f"🚀 {t} 주문 전송 중...")
+            await query.edit_message_text(f"🚀 {t} 수동 강제 전송 시작 (교차 분리)...")
             async with self.tx_lock:
                 cash, holdings = self.broker.get_account_balance()
                 if holdings is None: return await query.edit_message_text("❌ API 통신 오류로 주문을 실행할 수 없습니다.")
@@ -555,7 +567,6 @@ class TelegramController:
                 _, allocated_cash, force_turbo_off = self._calculate_budget_allocation(cash, self.cfg.get_active_tickers())
                 h = holdings.get(t, {'qty':0, 'avg':0})
                 
-                # 🌟 [V17.6 패치] 봇 블로킹 방어 (asyncio.to_thread 적용)
                 curr_p = await asyncio.to_thread(self.broker.get_current_price, t)
                 prev_c = await asyncio.to_thread(self.broker.get_previous_close, t)
                 ma_5day = await asyncio.to_thread(self.broker.get_5day_ma, t)
@@ -569,21 +580,28 @@ class TelegramController:
                 elif ver == "V14": ver_display = "무매4"
                 else: ver_display = "무매3"
                 
-                title = f"🔄 <b>[{t}] {ver_display} 리버스 주문 실행</b>\n" if is_rev else f"💎 <b>[{t}] 주문 실행 결과</b>\n"
-                msg, success_count = title, 0
+                title = f"🔄 <b>[{t}] {ver_display} 리버스 주문 수동 실행</b>\n" if is_rev else f"💎 <b>[{t}] 정규장 주문 수동 실행</b>\n"
+                msg = title
                 
                 all_success = True
-                for o in plan['orders']:
+                
+                # 🌟 [V17.7 패치] 단일 실행(EXEC) 시에도 1차 필수주문과 2차 보너스 주문을 엄격히 분리하여 실패(Lock) 판정
+                for o in plan.get('core_orders', []):
                     res = self.broker.send_order(t, o['side'], o['qty'], o['price'], o['type'])
                     is_success = res.get('rt_cd') == '0'
                     if not is_success: all_success = False
-                    msg += f"└ {o['desc']}: {'✅' if is_success else f'❌({res.get('msg1')})'}\n"
+                    msg += f"└ 1차 필수: {o['desc']} {o['qty']}주: {'✅' if is_success else f'❌({res.get('msg1')})'}\n"
+                    
+                for o in plan.get('bonus_orders', []):
+                    res = self.broker.send_order(t, o['side'], o['qty'], o['price'], o['type'])
+                    is_success = res.get('rt_cd') == '0'
+                    msg += f"└ 2차 보너스: {o['desc']} {o['qty']}주: {'✅' if is_success else '❌(잔금패스)'}\n"
                 
-                if all_success and len(plan['orders']) > 0:
+                if all_success and len(plan.get('core_orders', [])) > 0:
                     self.cfg.set_lock(t, "REG")
-                    msg += "\n🔒 <b>모든 주문 정상 전송 완료 (잠금 설정됨)</b>"
+                    msg += "\n🔒 <b>필수 주문 전송 완료 (잠금 설정됨)</b>"
                 else:
-                    msg += "\n⚠️ <b>일부 주문 실패 감지 (매매 잠금 보류 - 재시도 가능)</b>"
+                    msg += "\n⚠️ <b>일부 필수 주문 실패 (매매 잠금 보류)</b>"
 
             await context.bot.send_message(update.effective_chat.id, msg, parse_mode='HTML')
 

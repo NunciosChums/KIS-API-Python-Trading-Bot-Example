@@ -105,7 +105,6 @@ async def scheduled_premarket_monitor(context):
             h = holdings.get(t, {'qty': 0, 'avg': 0})
             if int(h['qty']) == 0: continue 
 
-            # 🌟 [V17.6 패치] 봇 블로킹 방어 (asyncio.to_thread 적용)
             curr_p = await asyncio.to_thread(broker.get_current_price, t)
             prev_c = await asyncio.to_thread(broker.get_previous_close, t)
             
@@ -119,6 +118,7 @@ async def scheduled_premarket_monitor(context):
                     msg += f"\n└ {o['desc']}: {'✅' if res.get('rt_cd') == '0' else f'❌({res.get('msg1')})'}"
                 await context.bot.send_message(chat_id=context.job.chat_id, text=msg, parse_mode='HTML')
 
+# 🌟 [V17.7 패치] 증거금 가로채기 방어: Two-Phase 교차 전송 엔진
 async def scheduled_regular_trade(context):
     if not is_market_open(): return
     chat_id = context.job.chat_id
@@ -131,42 +131,64 @@ async def scheduled_regular_trade(context):
     async with tx_lock:
         cash, holdings = broker.get_account_balance()
         if holdings is None:
-            await context.bot.send_message(chat_id=chat_id, text="❌ API 통신 오류로 계좌 정보를 불러오지 못해 정규장 주문을 취소합니다.", parse_mode='HTML')
+            await context.bot.send_message(chat_id=chat_id, text="❌ 계좌 정보를 불러오지 못해 정규장 주문을 취소합니다.", parse_mode='HTML')
             return
 
         sorted_tickers, allocated_cash, force_turbo_off = get_budget_allocation(cash, cfg.get_active_tickers(), cfg)
         
+        plans = {}
+        msgs = {t: "" for t in sorted_tickers}
+        all_success = {t: True for t in sorted_tickers}
+
+        # 0. 전략 일괄 수립 (Pre-fetch Plans)
         for t in sorted_tickers:
             if cfg.check_lock(t, "REG"): continue
             h = holdings.get(t, {'qty': 0, 'avg': 0})
             
-            # 🌟 [V17.6 패치] 봇 블로킹 방어 (asyncio.to_thread 적용)
             curr_p = await asyncio.to_thread(broker.get_current_price, t)
             prev_c = await asyncio.to_thread(broker.get_previous_close, t)
             ma_5day = await asyncio.to_thread(broker.get_5day_ma, t)
             
             plan = strategy.get_plan(t, curr_p, float(h['avg']), int(h['qty']), prev_c, ma_5day=ma_5day, market_type="REG", available_cash=allocated_cash[t], force_turbo_off=force_turbo_off)
+            plans[t] = plan
             
             if plan['orders']:
                 is_rev = plan.get('is_reverse', False)
-                title = f"🔄 <b>[{t}] 리버스 주문 실행</b>\n" if is_rev else f"💎 <b>[{t}] 주문 실행</b>\n"
-                msg = title
+                title = f"🔄 <b>[{t}] 리버스 주문 실행 (교차 전송)</b>\n" if is_rev else f"💎 <b>[{t}] 정규장 주문 실행 (교차 전송)</b>\n"
+                msgs[t] += title
+
+        # 1. 제 1라운드: 생존 필수 매수 (Core Buy) 교차 전송
+        for t in sorted_tickers:
+            if t not in plans or not plans[t]['orders']: continue
+            for o in plans[t].get('core_orders', []):
+                res = broker.send_order(t, o['side'], o['qty'], o['price'], o['type'])
+                is_success = res.get('rt_cd') == '0'
+                if not is_success: all_success[t] = False
+                msgs[t] += f"└ 1차 필수: {o['desc']} {o['qty']}주: {'✅' if is_success else f'❌({res.get('msg1')})'}\n"
+
+        # 2. 제 2라운드: 보너스 줍줍 (JubJub Extra) 교차 전송
+        for t in sorted_tickers:
+            if t not in plans or not plans[t]['orders']: continue
+            for o in plans[t].get('bonus_orders', []):
+                res = broker.send_order(t, o['side'], o['qty'], o['price'], o['type'])
+                is_success = res.get('rt_cd') == '0'
+                # 보너스 주문은 실패(증거금 부족)해도 Lock에 영향을 주지 않음 (패스 처리)
+                msgs[t] += f"└ 2차 보너스: {o['desc']} {o['qty']}주: {'✅' if is_success else '❌(잔금패스)'}\n"
+
+        # 3. 매매 결과 판정 및 락다운
+        for t in sorted_tickers:
+            if t not in plans or not plans[t]['orders']: continue
+            
+            if all_success[t] and len(plans[t].get('core_orders', [])) > 0:
+                cfg.set_lock(t, "REG")
+                msgs[t] += "\n🔒 <b>필수 주문 정상 전송 완료 (잠금 설정됨)</b>"
+            elif not all_success[t]:
+                msgs[t] += "\n⚠️ <b>일부 필수 주문 실패 (매매 잠금 보류 - 다음 스케줄 재시도)</b>"
+            else:
+                cfg.set_lock(t, "REG")
+                msgs[t] += "\n🔒 <b>보너스 줍줍 주문만 전송 완료 (잠금 설정됨)</b>"
                 
-                all_success = True
-                for o in plan['orders']:
-                    res = broker.send_order(t, o['side'], o['qty'], o['price'], o['type'])
-                    is_success = res.get('rt_cd') == '0'
-                    if not is_success:
-                        all_success = False
-                    msg += f"└ {o['desc']} {o['qty']}주: {'✅' if is_success else f'❌({res.get('msg1')})'}\n"
-                
-                if all_success and len(plan['orders']) > 0:
-                    cfg.set_lock(t, "REG")
-                    msg += "\n🔒 <b>모든 주문 정상 전송 완료 (매매 잠금 설정됨)</b>"
-                else:
-                    msg += "\n⚠️ <b>일부 주문 실패 감지 (매매 잠금 보류 - 다음 스케줄 재시도)</b>"
-                        
-                await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML')
+            await context.bot.send_message(chat_id=chat_id, text=msgs[t], parse_mode='HTML')
 
 async def scheduled_auto_sync_summer(context):
     if not is_dst_active(): return 
